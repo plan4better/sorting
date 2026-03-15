@@ -1,18 +1,16 @@
 const _ = require('lodash');
 const geolib = require('geolib');
 
-// helper object for defining population ranges
 const populations = {
-  mega:   [4000000, Infinity],
-  large:  [500000, 4000000],
+  mega: [4000000, Infinity],
+  large: [500000, 4000000],
   medium: [5000, 500000],
-  small:  [0, 5000]
+  small: [0, 5000]
 };
 
-// helper object for defining popularity ranges
 const popularities = {
   very_popular: [10000, Infinity],
-  popular:    [1000, 10000],
+  popular: [1000, 10000],
   nonpopular: [0, 1000]
 };
 
@@ -24,7 +22,6 @@ function isLayerAndValueInRange(isLayer, field, range, result) {
   return isLayer(result) && _.inRange(_.defaultTo(result[field], 0), range[0], range[1]);
 }
 
-// helper functions per layer
 const isContinent = isLayer.bind(null, 'continent');
 const isCountry = isLayer.bind(null, 'country');
 const isDependency = isLayer.bind(null, 'dependency');
@@ -53,25 +50,117 @@ const isVeryPopularNeighbourhood = isLayerAndValueInRange.bind(null, isNeighbour
 const isPopularNeighbourhood = isLayerAndValueInRange.bind(null, isNeighbourhood, 'popularity', popularities.popular);
 const isNonPopularNeighbourhood = isLayerAndValueInRange.bind(null, isNeighbourhood, 'popularity', popularities.nonpopular);
 
+function normalizeText(value) {
+  if (_.isNil(value)) {
+    return '';
+  }
+  return String(value).toLowerCase().trim();
+}
+
+function getFirstParentValue(result, key) {
+  const value = _.get(result, `parent.${key}`);
+  if (_.isArray(value)) {
+    return value[0];
+  }
+  return value;
+}
+
+function mismatchPenalty(clean, result) {
+  const parsedText = _.get(clean, 'parsed_text', {});
+  if (_.isNil(parsedText) || _.isNil(result)) {
+    return 0;
+  }
+
+  let penalty = 0;
+  const layer = result.layer;
+
+  if (layer === 'address' || layer === 'street') {
+    const queryPostalcode = normalizeText(parsedText.postalcode);
+    const resultPostalcode = normalizeText(_.get(result, 'address_parts.zip'));
+
+    if (queryPostalcode && resultPostalcode && queryPostalcode !== resultPostalcode) {
+      // If PLZ regions differ (first 2 digits), result is in a completely different
+      // part of the country — apply a very heavy penalty to push it below local matches.
+      // Same-region mismatches (e.g. 88212 vs 88214 in Ravensburg) get a mild penalty.
+      if (queryPostalcode.length >= 2 && resultPostalcode.length >= 2 &&
+          queryPostalcode.substring(0, 2) !== resultPostalcode.substring(0, 2)) {
+        penalty += 10000;
+      } else {
+        penalty += 35;
+      }
+    }
+
+    const queryCity = normalizeText(parsedText.city || parsedText.locality);
+    const resultLocality = normalizeText(getFirstParentValue(result, 'locality'));
+    const resultLocaladmin = normalizeText(getFirstParentValue(result, 'localadmin'));
+
+    if (queryCity && resultLocality && queryCity !== resultLocality && queryCity !== resultLocaladmin) {
+      penalty += 25;
+    }
+  }
+
+  // Venue layer: penalize locality mismatch (venues typically lack postalcode data)
+  if (layer === 'venue') {
+    const queryCity = normalizeText(parsedText.city || parsedText.locality);
+    const resultLocality = normalizeText(getFirstParentValue(result, 'locality'));
+    const resultLocaladmin = normalizeText(getFirstParentValue(result, 'localadmin'));
+
+    if (queryCity && resultLocality && queryCity !== resultLocality && queryCity !== resultLocaladmin) {
+      penalty += 10000;
+    }
+  }
+
+  return penalty;
+}
+
+// Check if a result's PLZ matches the query PLZ
+function plzMatches(clean, result) {
+  const parsedText = _.get(clean, 'parsed_text', {});
+  const queryPlz = normalizeText(_.get(parsedText, 'postalcode'));
+  if (!queryPlz) {
+    return null;
+  }
+  const resultPlz = normalizeText(_.get(result, 'address_parts.zip'));
+  if (!resultPlz) {
+    return null;
+  }
+  return queryPlz === resultPlz;
+}
+
+// Check if the result city matches the query city
+function cityMatches(clean, result) {
+  const parsedText = _.get(clean, 'parsed_text', {});
+  const queryCity = normalizeText(parsedText.city || parsedText.locality);
+  if (!queryCity) {
+    return null;
+  }
+  const resultLocality = normalizeText(getFirstParentValue(result, 'locality'));
+  const resultLocaladmin = normalizeText(getFirstParentValue(result, 'localadmin'));
+  if (!resultLocality) {
+    return null;
+  }
+  return queryCity === resultLocality || queryCity === resultLocaladmin;
+}
+
+function adjustedScore(clean, result) {
+  const baseScore = _.defaultTo(result._score, 0);
+  return baseScore - mismatchPenalty(clean, result);
+}
+
 function resolveByPopulation(isLayer, result1, result2) {
-  // if both are the requested layer, find the one with larger population
   if ([result1, result2].every(isLayer)) {
     return _.defaultTo(result2.population, 0) - _.defaultTo(result1.population, 0);
   }
 
-  // return the one that is the requested layer
   return isLayer(result1) ? -1 : 1;
-
 }
 
 function resolveByFocusPointThenOtherField(isLayer, field, result1, result2, focus_point) {
   if ([result1, result2].every(isLayer)) {
-    // if both are the requested layer, find the one closer to the focus point
     if (focus_point) {
       const lat_lon_1 = parse_lat_lon(result1.center_point, 'lat', 'lon');
       const lat_lon_2 = parse_lat_lon(result2.center_point, 'lat', 'lon');
 
-      // if both results have lat/lon, the closer to the focus_point is ranked higher
       if (lat_lon_1 && lat_lon_2) {
         const distance_1 = geolib.getDistance(focus_point, lat_lon_1);
         const distance_2 = geolib.getDistance(focus_point, lat_lon_2);
@@ -79,31 +168,21 @@ function resolveByFocusPointThenOtherField(isLayer, field, result1, result2, foc
         return distance_1 - distance_2;
       }
 
-      return (lat_lon_1) ? -1 : 1;
-
+      return lat_lon_1 ? -1 : 1;
     }
 
-    // no focus point, so on another field (currently only population or popularity)
-    // note: (undefined-undefined==NaN) which is not an acceptable comparitor value
     return _.defaultTo(result2[field], 0) - _.defaultTo(result1[field], 0);
-
   }
 
-  // return the one that is the requested layer
   return isLayer(result1) ? -1 : 1;
-
 }
 
-function resolveByScore(isLayer, result1, result2) {
+function resolveByScore(clean, isLayer, result1, result2) {
   if ([result1, result2].every(isLayer)) {
-    // sort on score
-    return result2._score - result1._score;
-
+    return adjustedScore(clean, result2) - adjustedScore(clean, result1);
   }
 
-  // return the one that is the requested layer
   return isLayer(result1) ? -1 : 1;
-
 }
 
 const resolveMegaLocality = resolveByPopulation.bind(null, isMegaLocality);
@@ -130,58 +209,71 @@ const resolveVeryPopularNeighbourhood = resolveByFocusPointThenOtherField.bind(n
 const resolvePopularNeighbourhood = resolveByFocusPointThenOtherField.bind(null, isPopularNeighbourhood, 'popularity');
 const resolveNonPopularNeighbourhood = resolveByFocusPointThenOtherField.bind(null, isNonPopularNeighbourhood, 'popularity');
 
-const resolveVenue = resolveByScore.bind(null, isVenue);
-
-// return a lat/lon object if both fields have value
 function parse_lat_lon(obj, lat_field, lon_field) {
   if ([lat_field, lon_field].every(_.has.bind(null, obj))) {
     return { latitude: obj[lat_field], longitude: obj[lon_field] };
   }
 }
 
-// array of either/resolve functions to call in order
-const fallbacks = [
-  { either: isMegaLocality, resolve: resolveMegaLocality },
-  { either: isMegaLocaladmin, resolve: resolveMegaLocaladmin },
-  { either: isContinent, resolve: resolveContinent },
-  { either: isCountry, resolve: resolveCountry },
-  { either: isDependency, resolve: resolveDependency },
-  { either: isLargeLocality, resolve: resolveLargeLocality },
-  { either: isLargeLocaladmin, resolve: resolveLargeLocaladmin },
-  { either: isMacroRegion, resolve: resolveMacroRegion },
-  { either: isRegion, resolve: resolveRegion },
-  { either: isBorough, resolve: resolveBorough },
-  { either: isVeryPopularNeighbourhood, resolve: resolveVeryPopularNeighbourhood },
-  { either: isMediumLocality, resolve: resolveMediumLocality },
-  { either: isMediumLocaladmin, resolve: resolveMediumLocaladmin },
-  { either: isMacroCounty, resolve: resolveMacroCounty },
-  { either: isCounty, resolve: resolveCounty },
-  { either: isMacroHood, resolve: resolveMacroHood },
-  { either: isVenue, resolve: resolveVenue },
-  { either: isPopularNeighbourhood, resolve: resolvePopularNeighbourhood },
-  { either: isSmallLocality, resolve: resolveSmallLocality },
-  { either: isSmallLocaladmin, resolve: resolveSmallLocaladmin },
-  { either: isNonPopularNeighbourhood, resolve: resolveNonPopularNeighbourhood },
-  // the 'else' case, always sort by score, avoiding returning 0 because js sort is unstable
-  { either: _.constant(true), resolve: (result1, result2) => {
-    if( isNaN( result1._score ) || isNaN( result2._score ) ){ return -1; }
-    if( result1._score === result2._score ){ return -1; }
-    return result1._score > result2._score ? -1 : 1;
-  }}
-];
-
 module.exports = (clean) => {
-  // get the focus.point from the request, could be undefined
   const focus_point = parse_lat_lon(clean, 'focus.point.lat', 'focus.point.lon');
+  const resolveVenue = resolveByScore.bind(null, clean, isVenue);
+
+  const fallbacks = [
+    { either: isMegaLocality, resolve: resolveMegaLocality },
+    { either: isMegaLocaladmin, resolve: resolveMegaLocaladmin },
+    { either: isContinent, resolve: resolveContinent },
+    { either: isCountry, resolve: resolveCountry },
+    { either: isDependency, resolve: resolveDependency },
+    { either: isLargeLocality, resolve: resolveLargeLocality },
+    { either: isLargeLocaladmin, resolve: resolveLargeLocaladmin },
+    { either: isMacroRegion, resolve: resolveMacroRegion },
+    { either: isRegion, resolve: resolveRegion },
+    { either: isBorough, resolve: resolveBorough },
+    { either: isVeryPopularNeighbourhood, resolve: resolveVeryPopularNeighbourhood },
+    { either: isMediumLocality, resolve: resolveMediumLocality },
+    { either: isMediumLocaladmin, resolve: resolveMediumLocaladmin },
+    { either: isMacroCounty, resolve: resolveMacroCounty },
+    { either: isCounty, resolve: resolveCounty },
+    { either: isMacroHood, resolve: resolveMacroHood },
+    { either: isVenue, resolve: resolveVenue },
+    { either: isPopularNeighbourhood, resolve: resolvePopularNeighbourhood },
+    { either: isSmallLocality, resolve: resolveSmallLocality },
+    { either: isSmallLocaladmin, resolve: resolveSmallLocaladmin },
+    { either: isNonPopularNeighbourhood, resolve: resolveNonPopularNeighbourhood },
+    {
+      either: _.constant(true),
+      resolve: (result1, result2) => {
+        const score1 = adjustedScore(clean, result1);
+        const score2 = adjustedScore(clean, result2);
+
+        if (isNaN(score1) || isNaN(score2)) {
+          return -1;
+        }
+
+        if (score1 === score2) {
+          // Tiebreaker: prefer city match when scores are equal
+          const city1 = cityMatches(clean, result1);
+          const city2 = cityMatches(clean, result2);
+          if (city1 === true && city2 === false) {
+            return -1;
+          }
+          if (city2 === true && city1 === false) {
+            return 1;
+          }
+          return -1;
+        }
+
+        return score1 > score2 ? -1 : 1;
+      }
+    }
+  ];
 
   return (result1, result2) => {
-    // find the first `either` that matches either result1 or result2
     const layer = fallbacks.find((layer) => {
       return [result1, result2].some(layer.either);
     });
 
-    // layer has been found so resolve the comparison (focus point may be ignored)
     return layer.resolve(result1, result2, focus_point);
-
   };
 };
